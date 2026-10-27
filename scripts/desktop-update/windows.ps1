@@ -104,9 +104,39 @@ $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
 
+# Lines the log could not take yet, oldest first. Add-Content opened the log per line inside
+# `try {} catch {}`, so whenever another process held it (a scanner on a just-closed file, a
+# reader opened without write sharing, a second hand-off process appending) the line was gone
+# for good -- and a relayed stage is marked seen before it is logged, so it was never written
+# again. A failed append now waits here and lands, in order, with the next one that succeeds.
+$script:PendingLogLines = New-Object System.Collections.Generic.List[string]
+
+function Sync-HandoffLog {
+    # Append every pending line in one write. AppendData with full sharing never conflicts with
+    # a reader, and lands at end-of-file atomically, so another hand-off process appending at the
+    # same moment cannot overwrite it. False while the log is still held: the lines stay queued.
+    if ($script:PendingLogLines.Count -eq 0) { return $true }
+    $bytes = [Text.Encoding]::UTF8.GetBytes((($script:PendingLogLines -join "`r`n") + "`r`n"))
+    try {
+        $stream = New-Object IO.FileStream($LogPath, [IO.FileMode]::Append,
+            [Security.AccessControl.FileSystemRights]::AppendData,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete), 4096, [IO.FileOptions]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    } catch { return $false }
+    $script:PendingLogLines.Clear()
+    return $true
+}
+
+function Complete-HandoffLog([int]$Seconds = 10) {
+    # Before exiting: a holder that outlives the run would otherwise take the last lines with it.
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while (-not (Sync-HandoffLog) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+}
+
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
-    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
+    $script:PendingLogLines.Add($line)
+    [void](Sync-HandoffLog)
     if ($MarkerOp) { return }   # a helper op's stdout is its one verdict line
     if ($script:ConsoleInput -and [HermesHandoff.ConsoleInput]::Selecting()) { return }
     Write-Host $line
@@ -1195,6 +1225,7 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
         }
         if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
         Update-MarkerHeartbeat
+        [void](Sync-HandoffLog)
         if ((Get-Date) -ge $nextStageCheck) {
             Sync-ChildStage
             $nextStageCheck = (Get-Date).AddSeconds(1)
@@ -1369,7 +1400,7 @@ exit 7
     # Writes straight to the console stream, holding nothing: a step that is
     # merely loud. `hermes update` is this shape -- the Electron/vite build
     # alone is megabytes. Few large lines rather than many small ones on
-    # purpose: Write-HandoffLog is one Add-Content per line and runs inside the
+    # purpose: Write-HandoffLog is one file append per line and runs inside the
     # measured window, so line-heavy output would time the logger instead of
     # the drain.
     $floodSource = @'
@@ -1888,5 +1919,6 @@ try {
         }
     }
     if ($null -ne $savedConsoleInputMode) { [HermesHandoff.ConsoleInput]::Restore($savedConsoleInputMode) }
+    Complete-HandoffLog
 }
 exit $finalCode
